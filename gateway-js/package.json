@@ -1,6 +1,6 @@
 {
   "name": "@apollo/gateway",
-  "version": "0.21.0",
+  "version": "0.21.0-khan.1",
   "description": "Apollo Gateway",
   "author": "Apollo <opensource@apollographql.com>",
   "main": "dist/index.js",
@@ -25,8 +25,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@apollo/federation": "file:../federation-js",
-    "@apollo/query-planner-wasm": "file:../query-planner-wasm",
+    "@apollo/federation": "0.20.4",
+    "@apollo/query-planner-wasm": "http://github.com:Khan/federation.git#apollo-query-planner-wasm-v0.0.6-khan.1-gitpkg",
     "@types/node-fetch": "2.5.4",
     "apollo-graphql": "^0.6.0",
     "apollo-reporting-protobuf": "^0.6.0",
