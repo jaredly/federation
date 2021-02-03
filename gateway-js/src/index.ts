@@ -203,7 +203,7 @@ export class ApolloGateway implements GraphQLService {
   private warnedStates: WarnedStates = Object.create(null);
   private queryPlannerPointer?: WasmPointer;
   private ownedQueryPlannerPointers: Array<WasmPointer>;
-  private inUse: number = 0;
+  private queryPlanUsage: number = 0;
   private cleanedUp: boolean = false;
 
   private fetcher: typeof fetch = getDefaultGcsFetcher();
@@ -317,7 +317,7 @@ export class ApolloGateway implements GraphQLService {
   // Call this to release memory in rust
   cleanup() {
     this.cleanedUp = true;
-    if (!this.inUse) {
+    if (this.queryPlanUsage <= 0) {
       this.ownedQueryPlannerPointers.forEach(pointer => {
         dropQueryPlanner(pointer);
       })
@@ -662,25 +662,30 @@ export class ApolloGateway implements GraphQLService {
     return getManagedConfig();
   }
 
-  public executor = <TContext>(
-    requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
-  ): Promise<GraphQLExecutionResult> => {
+  public getQueryPlanUsageForTesting() {
+    return this.queryPlanUsage
+  }
+  public hasBeenCleanedUp() {
+    return this.cleanedUp
+  }
+
+  protected trackQueryPlanUse = <T>(fn: () => Promise<T>): Promise<T> => {
     if (this.cleanedUp) {
       throw new Error(`ApolloGateway used after 'cleanup()' called.`)
     }
-    this.inUse += 1;
+    this.queryPlanUsage += 1;
     const cleanupIfNeeded = () => {
-      this.inUse -= 1;
+      this.queryPlanUsage -= 1;
       // If `gateway.cleanup()` was called while _executor was running,
       // then we wait until the request finishes to dispose of all of the
       // query planners.
-      if (this.inUse === 0 && this.cleanedUp) {
+      if (this.queryPlanUsage === 0 && this.cleanedUp) {
         this.ownedQueryPlannerPointers.forEach(pointer => {
           dropQueryPlanner(pointer);
         })
       }
     }
-    return this._executor(requestContext).then(
+    return fn().then(
       val => {
         cleanupIfNeeded()
         return val
@@ -690,6 +695,12 @@ export class ApolloGateway implements GraphQLService {
         throw err
       }
     )
+  }
+
+  public executor = <TContext>(
+    requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
+  ): Promise<GraphQLExecutionResult> => {
+    return this.trackQueryPlanUse(() => this._executor(requestContext));
   }
 
   // XXX Nothing guarantees that the only errors thrown or returned in
