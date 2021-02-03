@@ -203,7 +203,7 @@ export class ApolloGateway implements GraphQLService {
   private warnedStates: WarnedStates = Object.create(null);
   private queryPlannerPointer?: WasmPointer;
   private ownedQueryPlannerPointers: Array<WasmPointer>;
-  private queryPlanUsage: number = 0;
+  private inFlightQueryPlanUsages: number = 0;
   private cleanedUp: boolean = false;
 
   private fetcher: typeof fetch = getDefaultGcsFetcher();
@@ -317,7 +317,10 @@ export class ApolloGateway implements GraphQLService {
   // Call this to release memory in rust
   cleanup() {
     this.cleanedUp = true;
-    if (this.queryPlanUsage <= 0) {
+    // If there are currently in-flight usages,
+    // then `trackQueryPlanUse` will run the `dropQueryPlanner`s once they
+    // have completed.
+    if (this.inFlightQueryPlanUsages <= 0) {
       this.ownedQueryPlannerPointers.forEach(pointer => {
         dropQueryPlanner(pointer);
       })
@@ -663,23 +666,26 @@ export class ApolloGateway implements GraphQLService {
   }
 
   public getQueryPlanUsageForTesting() {
-    return this.queryPlanUsage
+    return this.inFlightQueryPlanUsages
   }
   public hasBeenCleanedUp() {
     return this.cleanedUp
   }
 
+  // Any subclasses that access `this.queryPlannerPointer` need to wrap their
+  // call in this function, so that we don't accidentally dispose of the
+  // rust-side data structure while it's being used.
   protected trackQueryPlanUse = <T>(fn: () => Promise<T>): Promise<T> => {
     if (this.cleanedUp) {
       throw new Error(`ApolloGateway used after 'cleanup()' called.`)
     }
-    this.queryPlanUsage += 1;
+    this.inFlightQueryPlanUsages += 1;
     const cleanupIfNeeded = () => {
-      this.queryPlanUsage -= 1;
+      this.inFlightQueryPlanUsages -= 1;
       // If `gateway.cleanup()` was called while _executor was running,
       // then we wait until the request finishes to dispose of all of the
       // query planners.
-      if (this.queryPlanUsage === 0 && this.cleanedUp) {
+      if (this.inFlightQueryPlanUsages === 0 && this.cleanedUp) {
         this.ownedQueryPlannerPointers.forEach(pointer => {
           dropQueryPlanner(pointer);
         })
