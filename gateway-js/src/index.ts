@@ -202,6 +202,9 @@ export class ApolloGateway implements GraphQLService {
   private serviceSdlCache = new Map<string, string>();
   private warnedStates: WarnedStates = Object.create(null);
   private queryPlannerPointer?: WasmPointer;
+  private ownedQueryPlannerPointers: Array<WasmPointer>;
+  private inUse: number = 0;
+  private cleanedUp: boolean = false;
 
   private fetcher: typeof fetch = getDefaultGcsFetcher();
 
@@ -232,6 +235,7 @@ export class ApolloGateway implements GraphQLService {
       __exposeQueryPlanExperimental: process.env.NODE_ENV !== 'production',
       ...config,
     };
+    this.ownedQueryPlannerPointers = [];
 
     // Setup logging facilities
     if (this.config.logger) {
@@ -258,6 +262,7 @@ export class ApolloGateway implements GraphQLService {
         this.logger.error("A valid schema couldn't be composed.")
       } else {
        this.queryPlannerPointer = getQueryPlanner(composedSdl);
+       this.ownedQueryPlannerPointers.push(this.queryPlannerPointer);
       }
     }
 
@@ -311,8 +316,11 @@ export class ApolloGateway implements GraphQLService {
 
   // Call this to release memory in rust
   cleanup() {
-    if (this.queryPlannerPointer != null) {
-      dropQueryPlanner(this.queryPlannerPointer)
+    this.cleanedUp = true;
+    if (!this.inUse) {
+      this.ownedQueryPlannerPointers.forEach(pointer => {
+        dropQueryPlanner(pointer);
+      })
     }
   }
 
@@ -424,11 +432,8 @@ export class ApolloGateway implements GraphQLService {
       )
     } else {
       this.schema = schema;
-      if (this.queryPlannerPointer != null) {
-        // Allow rust to release the memory for this QueryPlanner
-        dropQueryPlanner(this.queryPlannerPointer)
-      }
       this.queryPlannerPointer = getQueryPlanner(composedSdl);
+      this.ownedQueryPlannerPointers.push(this.queryPlannerPointer);
 
       // Notify the schema listeners of the updated schema
       try {
@@ -657,12 +662,42 @@ export class ApolloGateway implements GraphQLService {
     return getManagedConfig();
   }
 
+  public executor = <TContext>(
+    requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
+  ): Promise<GraphQLExecutionResult> => {
+    if (this.cleanedUp) {
+      throw new Error(`ApolloGateway used after 'cleanup()' called.`)
+    }
+    this.inUse += 1;
+    const cleanupIfNeeded = () => {
+      this.inUse -= 1;
+      // If `gateway.cleanup()` was called while _executor was running,
+      // then we wait until the request finishes to dispose of all of the
+      // query planners.
+      if (this.inUse === 0 && this.cleanedUp) {
+        this.ownedQueryPlannerPointers.forEach(pointer => {
+          dropQueryPlanner(pointer);
+        })
+      }
+    }
+    return this._executor(requestContext).then(
+      val => {
+        cleanupIfNeeded()
+        return val
+      },
+      err => {
+        cleanupIfNeeded()
+        throw err
+      }
+    )
+  }
+
   // XXX Nothing guarantees that the only errors thrown or returned in
   // result.errors are GraphQLErrors, even though other code (eg
   // ApolloServerPluginUsageReporting) assumes that. In fact, errors talking to backends
   // are unlikely to show up as GraphQLErrors. Do we need to use
   // formatApolloErrors or something?
-  public executor = async <TContext>(
+  private _executor = async <TContext>(
     requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
   ): Promise<GraphQLExecutionResult> => {
     const { request, document, queryHash, source } = requestContext;
