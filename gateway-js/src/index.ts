@@ -34,6 +34,7 @@ import {
   getServiceDefinitionsFromStorage,
   CompositionMetadata,
 } from './loadServicesFromStorage';
+import RefCounter from './refCounter'
 
 import { serializeQueryPlan, QueryPlan, OperationContext, WasmPointer } from './QueryPlan';
 import { GraphQLDataSource } from './datasources/types';
@@ -111,6 +112,9 @@ export type Experimental_DidResolveQueryPlanCallback = ({
 }: {
   readonly queryPlan: QueryPlan;
   readonly serviceMap: ServiceMap;
+  // Note that the `queryPlanPointer` on the operation context is *not guarenteed
+  // to be valid*. It may be cleaned up at any point, you cannot assume that it
+  // can be passed to query-planner-wasm without error.
   readonly operationContext: OperationContext;
   readonly requestContext: GraphQLRequestContextExecutionDidStart<Record<string, any>>;
 }) => void;
@@ -201,10 +205,7 @@ export class ApolloGateway implements GraphQLService {
   private compositionMetadata?: CompositionMetadata;
   private serviceSdlCache = new Map<string, string>();
   private warnedStates: WarnedStates = Object.create(null);
-  private queryPlannerPointer?: WasmPointer;
-  private ownedQueryPlannerPointers: Array<WasmPointer>;
-  private inFlightQueryPlanUsages: number = 0;
-  private cleanedUp: boolean = false;
+  private queryPlannerPointer?: RefCounter<WasmPointer>;
 
   private fetcher: typeof fetch = getDefaultGcsFetcher();
 
@@ -235,7 +236,6 @@ export class ApolloGateway implements GraphQLService {
       __exposeQueryPlanExperimental: process.env.NODE_ENV !== 'production',
       ...config,
     };
-    this.ownedQueryPlannerPointers = [];
 
     // Setup logging facilities
     if (this.config.logger) {
@@ -261,8 +261,7 @@ export class ApolloGateway implements GraphQLService {
       if (!composedSdl) {
         this.logger.error("A valid schema couldn't be composed.")
       } else {
-       this.queryPlannerPointer = getQueryPlanner(composedSdl);
-       this.ownedQueryPlannerPointers.push(this.queryPlannerPointer);
+       this.queryPlannerPointer = new RefCounter(getQueryPlanner(composedSdl), dropQueryPlanner);
       }
     }
 
@@ -316,15 +315,7 @@ export class ApolloGateway implements GraphQLService {
 
   // Call this to release memory in rust
   cleanup() {
-    this.cleanedUp = true;
-    // If there are currently in-flight usages,
-    // then `trackQueryPlanUse` will run the `dropQueryPlanner`s once they
-    // have completed.
-    if (this.inFlightQueryPlanUsages <= 0) {
-      this.ownedQueryPlannerPointers.forEach(pointer => {
-        dropQueryPlanner(pointer);
-      })
-    }
+    this.queryPlannerPointer?.cleanupWhenReady();
   }
 
   public async load(options?: { apollo?: ApolloConfig; engine?: GraphQLServiceEngineConfig }) {
@@ -435,8 +426,9 @@ export class ApolloGateway implements GraphQLService {
       )
     } else {
       this.schema = schema;
-      this.queryPlannerPointer = getQueryPlanner(composedSdl);
-      this.ownedQueryPlannerPointers.push(this.queryPlannerPointer);
+      // We don't have access to it anymore, so clean it up (when ready)
+      this.queryPlannerPointer?.cleanupWhenReady();
+      this.queryPlannerPointer = new RefCounter(getQueryPlanner(composedSdl), dropQueryPlanner);
 
       // Notify the schema listeners of the updated schema
       try {
@@ -665,48 +657,13 @@ export class ApolloGateway implements GraphQLService {
     return getManagedConfig();
   }
 
-  public getQueryPlanUsageForTesting() {
-    return this.inFlightQueryPlanUsages
-  }
-  public hasBeenCleanedUp() {
-    return this.cleanedUp
-  }
-
-  // Any subclasses that access `this.queryPlannerPointer` need to wrap their
-  // call in this function, so that we don't accidentally dispose of the
-  // rust-side data structure while it's being used.
-  protected trackQueryPlanUse = <T>(fn: () => Promise<T>): Promise<T> => {
-    if (this.cleanedUp) {
-      throw new Error(`ApolloGateway used after 'cleanup()' called.`)
-    }
-    this.inFlightQueryPlanUsages += 1;
-    const cleanupIfNeeded = () => {
-      this.inFlightQueryPlanUsages -= 1;
-      // If `gateway.cleanup()` was called while _executor was running,
-      // then we wait until the request finishes to dispose of all of the
-      // query planners.
-      if (this.inFlightQueryPlanUsages === 0 && this.cleanedUp) {
-        this.ownedQueryPlannerPointers.forEach(pointer => {
-          dropQueryPlanner(pointer);
-        })
-      }
-    }
-    return fn().then(
-      val => {
-        cleanupIfNeeded()
-        return val
-      },
-      err => {
-        cleanupIfNeeded()
-        throw err
-      }
-    )
-  }
-
   public executor = <TContext>(
     requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
   ): Promise<GraphQLExecutionResult> => {
-    return this.trackQueryPlanUse(() => this._executor(requestContext));
+    // The contents of queryPlannerPointer need to be accessed via this
+    // `withBorrow` so that we can ensure that we don't release the rust's
+    // queryPlanner before we're finished using it.
+    return this.queryPlannerPointer!.withBorrow((pointer) => this._executor(requestContext, pointer));
   }
 
   // XXX Nothing guarantees that the only errors thrown or returned in
@@ -716,6 +673,7 @@ export class ApolloGateway implements GraphQLService {
   // formatApolloErrors or something?
   private _executor = async <TContext>(
     requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
+    queryPlannerPointer: WasmPointer,
   ): Promise<GraphQLExecutionResult> => {
     const { request, document, queryHash, source } = requestContext;
     const queryPlanStoreKey = queryHash + (request.operationName || '');
@@ -723,7 +681,7 @@ export class ApolloGateway implements GraphQLService {
       schema: this.schema!,
       operationDocument: document,
       operationString: source,
-      queryPlannerPointer: this.queryPlannerPointer!,
+      queryPlannerPointer,
       operationName: request.operationName,
     });
 
@@ -785,6 +743,9 @@ export class ApolloGateway implements GraphQLService {
         queryPlan,
         serviceMap,
         requestContext,
+        // NOTE: This is the only place where the raw WasmPointer `queryPlannerPointer`
+        // can escape. The callback method didResolveQueryPlan should not assume
+        // that the pointer is valid.
         operationContext,
       });
     }
