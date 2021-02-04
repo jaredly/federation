@@ -154,24 +154,28 @@ describe('ApolloGateway executor', () => {
       logger,
     };
 
+    const refCounter = gateway.queryPlannerPointer!;
+    // Mock out the RefCounter's destruct, so we can check whether it has been
+    // called.
+    const destruct = refCounter.destruct = jest.fn();
+
     const one = executor(options);
     const two = executor(options);
 
-    expect(gateway.hasBeenCleanedUp()).toBeFalsy();
+    expect(destruct).not.toBeCalled();
     gateway.cleanup();
-    expect(gateway.hasBeenCleanedUp()).toBeTruthy();
+    expect(destruct).not.toBeCalled();
 
-    expect(gateway.getQueryPlanUsageForTesting()).toEqual(2);
     const [oneData, twoData] = await Promise.all([one, two]);
-    expect(gateway.getQueryPlanUsageForTesting()).toEqual(0);
+    expect(destruct).toBeCalled();
 
     expect(oneData.errors).toBeFalsy();
     expect(twoData.errors).toBeFalsy();
     expect(oneData.data).toEqual({ me });
     expect(twoData.data).toEqual({ me });
 
-    expect(() => executor(options)).toThrowErrorMatchingInlineSnapshot(
-      `"ApolloGateway used after 'cleanup()' called."`,
+    expect(() => executor(options)).rejects.toThrowErrorMatchingInlineSnapshot(
+      `"Cannot borrow a destructed value."`,
     );
   });
 });
