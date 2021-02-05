@@ -112,9 +112,11 @@ export type Experimental_DidResolveQueryPlanCallback = ({
 }: {
   readonly queryPlan: QueryPlan;
   readonly serviceMap: ServiceMap;
-  // Note that the `queryPlanPointer` on the operation context is *not guarenteed
-  // to be valid*. It may be cleaned up at any point, you cannot assume that it
-  // can be passed to query-planner-wasm without error.
+  // Note that this `queryPlanPointer` on the operation context that's passed to
+  // didResolveQueryPlanCallback is *not guarenteed to be valid*.
+  // It is valid for the duration of the `_executor` call, but if you store the
+  // pointer from this callback lifecycle method and try to use it later, it
+  // might already have been disposed of on the rust side.
   readonly operationContext: OperationContext;
   readonly requestContext: GraphQLRequestContextExecutionDidStart<Record<string, any>>;
 }) => void;
