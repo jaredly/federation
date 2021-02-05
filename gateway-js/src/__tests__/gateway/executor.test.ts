@@ -1,6 +1,6 @@
 import gql from 'graphql-tag';
 import { ApolloGateway } from '../../';
-import { ApolloServer } from "apollo-server";
+import { ApolloServer } from 'apollo-server';
 import { fixtures } from 'apollo-federation-integration-testsuite';
 import { Logger } from 'apollo-server-types';
 import { fetch } from '__mocks__/apollo-server-env';
@@ -56,7 +56,7 @@ describe('ApolloGateway executor', () => {
   });
 
   it('should not crash if no variables are not provided', async () => {
-    const me = { id: '1', birthDate: '1988-10-21'};
+    const me = { id: '1', birthDate: '1988-10-21' };
     fetch.mockJSONResponseOnce({ data: { me } });
     const gateway = new ApolloGateway({
       localServiceList: fixtures,
@@ -76,8 +76,7 @@ describe('ApolloGateway executor', () => {
     const { errors, data } = await executor({
       source,
       document: gql(source),
-      request: {
-      },
+      request: {},
       queryHash: 'hashed',
       context: null,
       cache: {} as any,
@@ -97,11 +96,9 @@ describe('ApolloGateway executor', () => {
 
     // Mock implementation of process.exit with another () => never function.
     // This is because the gateway doesn't just throw in this scenario, it crashes.
-    const mockExit = jest
-      .spyOn(process, 'exit')
-      .mockImplementation((code) => {
-        throw new Error(code?.toString());
-      });
+    const mockExit = jest.spyOn(process, 'exit').mockImplementation((code) => {
+      throw new Error(code?.toString());
+    });
 
     const server = new ApolloServer({
       gateway,
@@ -111,15 +108,74 @@ describe('ApolloGateway executor', () => {
 
     // Ensure the throw happens to maintain the correctness of this test.
     await expect(
-      server.executeOperation({ query: '{ __typename }' })).rejects.toThrow();
+      server.executeOperation({ query: '{ __typename }' }),
+    ).rejects.toThrow();
 
     expect(server.requestOptions.executor).toBe(gateway.executor);
 
     expect(logger.error.mock.calls).toEqual([
-      ["Error checking for changes to service definitions: Tried to load services from remote endpoints but none provided"],
-      ["This data graph is missing a valid configuration. Tried to load services from remote endpoints but none provided"]
+      [
+        'Error checking for changes to service definitions: Tried to load services from remote endpoints but none provided',
+      ],
+      [
+        'This data graph is missing a valid configuration. Tried to load services from remote endpoints but none provided',
+      ],
     ]);
 
     mockExit.mockRestore();
+  });
+
+  it('should track query plan usage, and wait until they are finished to clean up', async () => {
+    const me = { id: '1', birthDate: '1988-10-21' };
+    fetch.mockJSONResponseOnce({ data: { me } });
+    fetch.mockJSONResponseOnce({ data: { me } });
+    const gateway = new ApolloGateway({
+      localServiceList: fixtures,
+    });
+
+    const { executor } = await gateway.load();
+
+    const source = `#graphql
+      query Me($locale: String) {
+        me {
+          id
+          birthDate(locale: $locale)
+        }
+      }
+    `;
+
+    const options = {
+      source,
+      document: gql(source),
+      request: {},
+      queryHash: 'hashed',
+      context: null,
+      cache: {} as any,
+      logger,
+    };
+
+    const refCounter = gateway.queryPlannerPointer!;
+    // Mock out the RefCounter's destruct, so we can check whether it has been
+    // called.
+    const destruct = refCounter.destruct = jest.fn();
+
+    const one = executor(options);
+    const two = executor(options);
+
+    expect(destruct).not.toBeCalled();
+    gateway.cleanup();
+    expect(destruct).not.toBeCalled();
+
+    const [oneData, twoData] = await Promise.all([one, two]);
+    expect(destruct).toBeCalled();
+
+    expect(oneData.errors).toBeFalsy();
+    expect(twoData.errors).toBeFalsy();
+    expect(oneData.data).toEqual({ me });
+    expect(twoData.data).toEqual({ me });
+
+    expect(() => executor(options)).rejects.toThrowErrorMatchingInlineSnapshot(
+      `"Cannot borrow a destructed value."`,
+    );
   });
 });

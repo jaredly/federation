@@ -34,6 +34,7 @@ import {
   getServiceDefinitionsFromStorage,
   CompositionMetadata,
 } from './loadServicesFromStorage';
+import RefCounter from './refCounter'
 
 import { serializeQueryPlan, QueryPlan, OperationContext, WasmPointer } from './QueryPlan';
 import { GraphQLDataSource } from './datasources/types';
@@ -111,6 +112,11 @@ export type Experimental_DidResolveQueryPlanCallback = ({
 }: {
   readonly queryPlan: QueryPlan;
   readonly serviceMap: ServiceMap;
+  // Note that this `queryPlanPointer` on the operation context that's passed to
+  // didResolveQueryPlanCallback is *not guarenteed to be valid*.
+  // It is valid for the duration of the `_executor` call, but if you store the
+  // pointer from this callback lifecycle method and try to use it later, it
+  // might already have been disposed of on the rust side.
   readonly operationContext: OperationContext;
   readonly requestContext: GraphQLRequestContextExecutionDidStart<Record<string, any>>;
 }) => void;
@@ -201,7 +207,7 @@ export class ApolloGateway implements GraphQLService {
   private compositionMetadata?: CompositionMetadata;
   private serviceSdlCache = new Map<string, string>();
   private warnedStates: WarnedStates = Object.create(null);
-  private queryPlannerPointer?: WasmPointer;
+  private queryPlannerPointer?: RefCounter<WasmPointer>;
 
   private fetcher: typeof fetch = getDefaultGcsFetcher();
 
@@ -257,7 +263,7 @@ export class ApolloGateway implements GraphQLService {
       if (!composedSdl) {
         this.logger.error("A valid schema couldn't be composed.")
       } else {
-       this.queryPlannerPointer = getQueryPlanner(composedSdl);
+       this.queryPlannerPointer = new RefCounter(getQueryPlanner(composedSdl), dropQueryPlanner);
       }
     }
 
@@ -311,9 +317,7 @@ export class ApolloGateway implements GraphQLService {
 
   // Call this to release memory in rust
   cleanup() {
-    if (this.queryPlannerPointer != null) {
-      dropQueryPlanner(this.queryPlannerPointer)
-    }
+    this.queryPlannerPointer?.cleanupWhenReady();
   }
 
   public async load(options?: { apollo?: ApolloConfig; engine?: GraphQLServiceEngineConfig }) {
@@ -424,11 +428,9 @@ export class ApolloGateway implements GraphQLService {
       )
     } else {
       this.schema = schema;
-      if (this.queryPlannerPointer != null) {
-        // Allow rust to release the memory for this QueryPlanner
-        dropQueryPlanner(this.queryPlannerPointer)
-      }
-      this.queryPlannerPointer = getQueryPlanner(composedSdl);
+      // We don't have access to it anymore, so clean it up (when ready)
+      this.queryPlannerPointer?.cleanupWhenReady();
+      this.queryPlannerPointer = new RefCounter(getQueryPlanner(composedSdl), dropQueryPlanner);
 
       // Notify the schema listeners of the updated schema
       try {
@@ -657,13 +659,23 @@ export class ApolloGateway implements GraphQLService {
     return getManagedConfig();
   }
 
+  public executor = <TContext>(
+    requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
+  ): Promise<GraphQLExecutionResult> => {
+    // The contents of queryPlannerPointer need to be accessed via this
+    // `withBorrow` so that we can ensure that we don't release the rust's
+    // queryPlanner before we're finished using it.
+    return this.queryPlannerPointer!.withBorrow((pointer) => this._executor(requestContext, pointer));
+  }
+
   // XXX Nothing guarantees that the only errors thrown or returned in
   // result.errors are GraphQLErrors, even though other code (eg
   // ApolloServerPluginUsageReporting) assumes that. In fact, errors talking to backends
   // are unlikely to show up as GraphQLErrors. Do we need to use
   // formatApolloErrors or something?
-  public executor = async <TContext>(
+  private _executor = async <TContext>(
     requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
+    queryPlannerPointer: WasmPointer,
   ): Promise<GraphQLExecutionResult> => {
     const { request, document, queryHash, source } = requestContext;
     const queryPlanStoreKey = queryHash + (request.operationName || '');
@@ -671,7 +683,7 @@ export class ApolloGateway implements GraphQLService {
       schema: this.schema!,
       operationDocument: document,
       operationString: source,
-      queryPlannerPointer: this.queryPlannerPointer!,
+      queryPlannerPointer,
       operationName: request.operationName,
     });
 
@@ -733,6 +745,9 @@ export class ApolloGateway implements GraphQLService {
         queryPlan,
         serviceMap,
         requestContext,
+        // NOTE: This is the only place where the raw WasmPointer `queryPlannerPointer`
+        // can escape. The callback method didResolveQueryPlan should not assume
+        // that the pointer is valid.
         operationContext,
       });
     }
