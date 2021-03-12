@@ -14,13 +14,26 @@ module.exports = {
         sidebarCategories: {
           null: [
             'index',
+          ],
+          'Core Concepts': [
             'implementing-services',
             'gateway',
             'entities',
             'value-types',
+            'migrating-from-stitching',
+          ],
+          'Managed Federation': [
+            'managed-federation/overview',
+            'managed-federation/setup',
+            'managed-federation/federated-schema-checks',
+            'managed-federation/deployment',
+            'managed-federation/monitoring',
+          ],
+          'Debugging': [
             'errors',
             'metrics',
-            'migrating-from-stitching',
+          ],
+          'Third-Party Support': [
             'other-servers',
             'federation-spec',
           ],
