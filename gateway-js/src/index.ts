@@ -3,6 +3,7 @@ import {
   SchemaChangeCallback,
   Unsubscriber,
   GraphQLServiceEngineConfig,
+  gql,
 } from 'apollo-server-core';
 import {
   GraphQLExecutionResult,
@@ -16,9 +17,9 @@ import {
   isIntrospectionType,
   GraphQLSchema,
   VariableDefinitionNode,
-  parse,
   visit,
   DocumentNode,
+  print,
   FragmentDefinitionNode,
   OperationDefinitionNode,
 } from 'graphql';
@@ -39,16 +40,12 @@ import {
 } from './executeQueryPlan';
 
 import { getServiceDefinitionsFromRemoteEndpoint } from './loadServicesFromRemoteEndpoint';
-import {
-  getServiceDefinitionsFromStorage,
-  CompositionMetadata,
-} from './loadServicesFromStorage';
 import RefCounter from './refCounter';
 
 import { GraphQLDataSource } from './datasources/types';
 import { RemoteGraphQLDataSource } from './datasources/RemoteGraphQLDataSource';
 import { getVariableValues } from 'graphql/execution/values';
-import fetcher from 'make-fetch-happen';
+import fetcher, { Fetcher } from 'make-fetch-happen';
 import { HttpRequestCache } from './cache';
 import { fetch } from 'apollo-server-env';
 import {
@@ -64,8 +61,8 @@ import {
   Experimental_DidFailCompositionCallback,
   Experimental_DidResolveQueryPlanCallback,
   Experimental_DidUpdateCompositionCallback,
-  Experimental_UpdateServiceDefinitions,
-  Experimental_CompositionInfo,
+  Experimental_UpdateComposition,
+  CompositionInfo,
   GatewayConfig,
   StaticGatewayConfig,
   RemoteGatewayConfig,
@@ -76,7 +73,16 @@ import {
   isManagedConfig,
   isDynamicConfig,
   isStaticConfig,
+  CompositionMetadata,
+  isCsdlUpdate,
+  isServiceDefinitionUpdate,
+  ServiceDefinitionUpdate,
+  CsdlUpdate,
+  CompositionUpdate,
+  isPrecomposedManagedConfig,
 } from './config';
+import { loadCsdlFromStorage } from './loadCsdlFromStorage';
+import { getServiceDefinitionsFromStorage } from './legacyLoadServicesFromStorage';
 
 type FragmentMap = { [fragmentName: string]: FragmentDefinitionNode };
 
@@ -92,8 +98,6 @@ type DataSourceMap = {
   [serviceName: string]: { url?: string; dataSource: GraphQLDataSource };
 };
 
-type Await<T> = T extends Promise<infer U> ? U : T;
-
 // Local state to track whether particular UX-improving warning messages have
 // already been emitted.  This is particularly useful to prevent recurring
 // warnings of the same type in, e.g. repeating timers, which don't provide
@@ -103,19 +107,21 @@ type WarnedStates = {
   remoteWithLocalConfig?: boolean;
 };
 
-export const GCS_RETRY_COUNT = 5;
-
-export function getDefaultGcsFetcher() {
+export function getDefaultFetcher(): Fetcher {
+  const { name, version } = require('../package.json');
   return fetcher.defaults({
     cacheManager: new HttpRequestCache(),
     // All headers should be lower-cased here, as `make-fetch-happen`
     // treats differently cased headers as unique (unlike the `Headers` object).
     // @see: https://git.io/JvRUa
     headers: {
-      'user-agent': `apollo-gateway/${require('../package.json').version}`,
+      'apollographql-client-name': name,
+      'apollographql-client-version': version,
+      'user-agent': `${name}/${version}`,
+      'content-type': 'application/json',
     },
     retry: {
-      retries: GCS_RETRY_COUNT,
+      retries: 5,
       // The default factor: expected attempts at 0, 1, 3, 7, 15, and 31 seconds elapsed
       factor: 2,
       // 1 second
@@ -125,6 +131,17 @@ export function getDefaultGcsFetcher() {
   });
 }
 
+/**
+ * TODO(trevor:cloudconfig): Stop exporting this
+ * @deprecated This will be removed in a future version of @apollo/gateway
+ */
+export const getDefaultGcsFetcher = getDefaultFetcher;
+/**
+ * TODO(trevor:cloudconfig): Stop exporting this
+ * @deprecated This will be removed in a future version of @apollo/gateway
+ */
+export const GCS_RETRY_COUNT = 5;
+
 export const HEALTH_CHECK_QUERY =
   'query __ApolloServiceHealthCheck__ { __typename }';
 export const SERVICE_DEFINITION_QUERY =
@@ -132,6 +149,7 @@ export const SERVICE_DEFINITION_QUERY =
 
 type GatewayState =
   | { phase: 'initialized' }
+  | { phase: 'failed to load' }
   | { phase: 'loaded' }
   | { phase: 'stopping'; stoppingDonePromise: Promise<void> }
   | { phase: 'stopped' }
@@ -143,10 +161,10 @@ type GatewayState =
   | { phase: 'polling'; pollingDonePromise: Promise<void> };
 export class ApolloGateway implements GraphQLService {
   public schema?: GraphQLSchema;
-  protected serviceMap: DataSourceMap = Object.create(null);
-  protected config: GatewayConfig;
+  private serviceMap: DataSourceMap = Object.create(null);
+  private config: GatewayConfig;
   private logger: Logger;
-  protected queryPlanStore: InMemoryLRUCache<QueryPlan>;
+  private queryPlanStore: InMemoryLRUCache<QueryPlan>;
   private apolloConfig?: ApolloConfig;
   private onSchemaChangeListeners = new Set<SchemaChangeCallback>();
   private serviceDefinitions: ServiceDefinition[] = [];
@@ -156,25 +174,29 @@ export class ApolloGateway implements GraphQLService {
   private queryPlannerPointer?: RefCounter<QueryPlannerPointer>;
   private parsedCsdl?: DocumentNode;
   private fetcher: typeof fetch;
-
+  private compositionId?: string;
   private state: GatewayState;
 
   // Observe query plan, service info, and operation info prior to execution.
   // The information made available here will give insight into the resulting
   // query plan and the inputs that generated it.
-  protected experimental_didResolveQueryPlan?: Experimental_DidResolveQueryPlanCallback;
+  private experimental_didResolveQueryPlan?: Experimental_DidResolveQueryPlanCallback;
   // Observe composition failures and the ServiceList that caused them. This
   // enables reporting any issues that occur during composition. Implementors
   // will be interested in addressing these immediately.
-  protected experimental_didFailComposition?: Experimental_DidFailCompositionCallback;
+  private experimental_didFailComposition?: Experimental_DidFailCompositionCallback;
   // Used to communicated composition changes, and what definitions caused
   // those updates
-  protected experimental_didUpdateComposition?: Experimental_DidUpdateCompositionCallback;
+  private experimental_didUpdateComposition?: Experimental_DidUpdateCompositionCallback;
   // Used for overriding the default service list fetcher. This should return
   // an array of ServiceDefinition. *This function must be awaited.*
-  protected updateServiceDefinitions: Experimental_UpdateServiceDefinitions;
+  private updateServiceDefinitions: Experimental_UpdateComposition;
   // how often service defs should be loaded/updated (in ms)
-  protected experimental_pollInterval?: number;
+  private experimental_pollInterval?: number;
+  // Configure the endpoint by which gateway will access its precomposed schema.
+  // For now, `null` is default and means to continue using the legacy managed mode.
+  // TODO(trevor:cloudconfig): `null` should be disallowed in the future.
+  private experimental_schemaConfigDeliveryEndpoint: string | null;
 
   constructor(config?: GatewayConfig) {
     this.config = {
@@ -189,7 +211,7 @@ export class ApolloGateway implements GraphQLService {
     this.queryPlanStore = this.initQueryPlanStore(
       config?.experimental_approximateQueryPlanStoreMiB,
     );
-    this.fetcher = config?.fetcher || getDefaultGcsFetcher();
+    this.fetcher = config?.fetcher || getDefaultFetcher();
 
     // set up experimental observability callbacks and config settings
     this.experimental_didResolveQueryPlan =
@@ -201,10 +223,32 @@ export class ApolloGateway implements GraphQLService {
 
     this.experimental_pollInterval = config?.experimental_pollInterval;
 
+    // Do not use this unless advised by Apollo staff to do so
+    this.experimental_schemaConfigDeliveryEndpoint =
+      process.env.APOLLO_SCHEMA_CONFIG_DELIVERY_ENDPOINT ?? null;
+
+    if (isPrecomposedManagedConfig(this.config)) {
+      // If the env was already set, it will maintain precedence here.
+      this.experimental_schemaConfigDeliveryEndpoint =
+        this.experimental_schemaConfigDeliveryEndpoint ??
+        this.config.experimental_schemaConfigDeliveryEndpoint ??
+        null;
+    }
+
     // Use the provided updater function if provided by the user, else default
-    this.updateServiceDefinitions = isManuallyManagedConfig(this.config)
-      ? this.config.experimental_updateServiceDefinitions
-      : this.loadServiceDefinitions;
+    if (isManuallyManagedConfig(this.config)) {
+      if ('experimental_updateCsdl' in this.config) {
+        this.updateServiceDefinitions = this.config.experimental_updateCsdl;
+      } else if ('experimental_updateServiceDefinitions' in this.config) {
+        this.updateServiceDefinitions = this.config.experimental_updateServiceDefinitions;
+      } else {
+        throw Error(
+          'Programming error: unexpected manual configuration provided',
+        );
+      }
+    } else {
+      this.updateServiceDefinitions = this.loadServiceDefinitions;
+    }
 
     if (isDynamicConfig(this.config)) {
       this.issueDynamicWarningsIfApplicable();
@@ -267,6 +311,19 @@ export class ApolloGateway implements GraphQLService {
         'Polling running services is dangerous and not recommended in production. ' +
           'Polling should only be used against a registry. ' +
           'If you are polling running services, use with caution.',
+      );
+    }
+
+    if (
+      isManuallyManagedConfig(this.config) &&
+      'experimental_updateCsdl' in this.config &&
+      'experimental_updateServiceDefinitions' in this.config
+    ) {
+      this.logger.warn(
+        'Gateway found two manual update configurations when only one should be ' +
+          'provided. Gateway will default to using the provided `experimental_updateCsdl` ' +
+          'function when both `experimental_updateCsdl` and experimental_updateServiceDefinitions` ' +
+          'are provided.',
       );
     }
   }
@@ -349,14 +406,19 @@ export class ApolloGateway implements GraphQLService {
   // Synchronously load a statically configured schema, update class instance's
   // schema and query planner.
   private loadStatic(config: StaticGatewayConfig) {
-    const schemaConstructionOpts = isLocalConfig(config)
-      ? { serviceList: config.localServiceList }
-      : { csdl: config.csdl };
-
-    const { schema, composedSdl } = this.createSchema(schemaConstructionOpts);
+    let schema: GraphQLSchema;
+    let composedSdl: string;
+    try {
+      ({ schema, composedSdl } = isLocalConfig(config)
+        ? this.createSchemaFromServiceList(config.localServiceList)
+        : this.createSchemaFromCsdl(config.csdl));
+    } catch (e) {
+      this.state = { phase: 'failed to load' };
+      throw e;
+    }
 
     this.schema = schema;
-    this.parsedCsdl = parse(composedSdl);
+    this.parsedCsdl = gql(composedSdl);
     this.queryPlannerPointer = new RefCounter(
       getQueryPlanner(composedSdl),
       dropQueryPlanner,
@@ -364,10 +426,16 @@ export class ApolloGateway implements GraphQLService {
     this.state = { phase: 'loaded' };
   }
 
-  // Asynchronously load a dynamically configured schema. `this.updateComposition`
+  // Asynchronously load a dynamically configured schema. `this.updateSchema`
   // is responsible for updating the class instance's schema and query planner.
   private async loadDynamic(unrefTimer: boolean) {
-    await this.updateComposition();
+    try {
+      await this.updateSchema();
+    } catch (e) {
+      this.state = { phase: 'failed to load' };
+      throw e;
+    }
+
     this.state = { phase: 'loaded' };
     if (this.shouldBeginPolling()) {
       this.pollServices(unrefTimer);
@@ -378,19 +446,26 @@ export class ApolloGateway implements GraphQLService {
     return isManagedConfig(this.config) || this.experimental_pollInterval;
   }
 
-  protected async updateComposition(): Promise<void> {
-    let result: Await<ReturnType<Experimental_UpdateServiceDefinitions>>;
-    this.logger.debug('Checking service definitions...');
-    try {
-      result = await this.updateServiceDefinitions(this.config);
-    } catch (e) {
-      this.logger.error(
-        'Error checking for changes to service definitions: ' +
-          ((e && e.message) || e),
-      );
-      throw e;
-    }
+  private async updateSchema(): Promise<void> {
+    this.logger.debug('Checking for composition updates...');
 
+    // This may throw, but an error here is caught and logged upstream
+    const result = await this.updateServiceDefinitions(this.config);
+
+    if (isCsdlUpdate(result)) {
+      await this.updateWithCsdl(result);
+    } else if (isServiceDefinitionUpdate(result)) {
+      await this.updateByComposition(result);
+    } else {
+      throw new Error(
+        'Programming error: unexpected result type from `updateServiceDefinitions`',
+      );
+    }
+  }
+
+  private async updateByComposition(
+    result: ServiceDefinitionUpdate,
+  ): Promise<void> {
     if (
       !result.serviceDefinitions ||
       JSON.stringify(this.serviceDefinitions) ===
@@ -408,42 +483,16 @@ export class ApolloGateway implements GraphQLService {
       this.logger.info('New service definitions were found.');
     }
 
-    // Run service health checks before we commit and update the new schema.
-    // This is the last chance to bail out of a schema update.
-    if (this.config.serviceHealthCheck) {
-      // Here we need to construct new datasources based on the new schema info
-      // so we can check the health of the services we're _updating to_.
-      const serviceMap = result.serviceDefinitions.reduce(
-        (serviceMap, serviceDef) => {
-          serviceMap[serviceDef.name] = {
-            url: serviceDef.url,
-            dataSource: this.createDataSource(serviceDef),
-          };
-          return serviceMap;
-        },
-        Object.create(null) as DataSourceMap,
-      );
-
-      try {
-        await this.serviceHealthCheck(serviceMap);
-      } catch (e) {
-        this.logger.error(
-          'The gateway did not update its schema due to failed service health checks.  ' +
-            'The gateway will continue to operate with the previous schema and reattempt updates.' +
-            e,
-        );
-        throw e;
-      }
-    }
+    await this.maybePerformServiceHealthCheck(result);
 
     this.compositionMetadata = result.compositionMetadata;
     this.serviceDefinitions = result.serviceDefinitions;
 
     if (this.queryPlanStore) this.queryPlanStore.flush();
 
-    const { schema, composedSdl } = this.createSchema({
-      serviceList: result.serviceDefinitions,
-    });
+    const { schema, composedSdl } = this.createSchemaFromServiceList(
+      result.serviceDefinitions,
+    );
 
     if (!composedSdl) {
       this.logger.error(
@@ -493,6 +542,113 @@ export class ApolloGateway implements GraphQLService {
     }
   }
 
+  private async updateWithCsdl(result: CsdlUpdate): Promise<void> {
+    if (result.id === this.compositionId) {
+      this.logger.debug('No change in composition since last check.');
+      return;
+    }
+
+    // This may throw, so we'll calculate early (specifically before making any updates)
+    // In the case that it throws, the gateway will:
+    //   * on initial load, throw the error
+    //   * on update, log the error and don't update
+    const parsedCsdl = gql(result.csdl);
+
+    const previousSchema = this.schema;
+    const previousCsdl = this.parsedCsdl;
+    const previousCompositionId = this.compositionId;
+
+    if (previousSchema) {
+      this.logger.info('Updated CSDL was found.');
+    }
+
+    await this.maybePerformServiceHealthCheck(result);
+
+    this.compositionId = result.id;
+    this.parsedCsdl = parsedCsdl;
+
+    if (this.queryPlanStore) this.queryPlanStore.flush();
+
+    const { schema, composedSdl } = this.createSchemaFromCsdl(result.csdl);
+
+    if (!composedSdl) {
+      this.logger.error(
+        "A valid schema couldn't be composed. Falling back to previous schema.",
+      );
+    } else {
+      this.schema = schema;
+      // We don't have access to it anymore, so clean it up (when ready)
+      this.queryPlannerPointer?.cleanupWhenReady();
+      this.queryPlannerPointer = new RefCounter(
+        getQueryPlanner(composedSdl),
+        dropQueryPlanner,
+      );
+
+      // Notify the schema listeners of the updated schema
+      try {
+        this.onSchemaChangeListeners.forEach((listener) =>
+          listener(this.schema!),
+        );
+      } catch (e) {
+        this.logger.error(
+          "An error was thrown from an 'onSchemaChange' listener. " +
+            'The schema will still update: ' +
+            ((e && e.message) || e),
+        );
+      }
+
+      if (this.experimental_didUpdateComposition) {
+        this.experimental_didUpdateComposition(
+          {
+            compositionId: result.id,
+            csdl: result.csdl,
+            schema: this.schema,
+          },
+          previousCompositionId && previousCsdl && previousSchema
+            ? {
+                compositionId: previousCompositionId,
+                csdl: print(previousCsdl),
+                schema: previousSchema,
+              }
+            : undefined,
+        );
+      }
+    }
+  }
+
+  private async maybePerformServiceHealthCheck(update: CompositionUpdate) {
+    // Run service health checks before we commit and update the new schema.
+    // This is the last chance to bail out of a schema update.
+    if (this.config.serviceHealthCheck) {
+      const serviceList = isCsdlUpdate(update)
+        ? // Parsing could technically fail and throw here, but parseability has
+          // already been confirmed slightly earlier in the code path
+          this.serviceListFromCsdl(gql(update.csdl))
+        : // Existence of this is determined in advance with an early return otherwise
+          update.serviceDefinitions!;
+      // Here we need to construct new datasources based on the new schema info
+      // so we can check the health of the services we're _updating to_.
+      const serviceMap = serviceList.reduce((serviceMap, serviceDef) => {
+        serviceMap[serviceDef.name] = {
+          url: serviceDef.url,
+          dataSource: this.createDataSource(serviceDef),
+        };
+        return serviceMap;
+      }, Object.create(null) as DataSourceMap);
+
+      try {
+        await this.serviceHealthCheck(serviceMap);
+      } catch (e) {
+        throw new Error(
+          'The gateway did not update its schema due to failed service health checks. ' +
+            'The gateway will continue to operate with the previous schema and reattempt updates. ' +
+            'The following error occurred during the health check:\n' +
+            e.message,
+        );
+      }
+    }
+  }
+
   /**
    * This can be used without an argument in order to perform an ad-hoc health check
    * of the downstream services like so:
@@ -513,22 +669,15 @@ export class ApolloGateway implements GraphQLService {
       Object.entries(serviceMap).map(([name, { dataSource }]) =>
         dataSource
           .process({ request: { query: HEALTH_CHECK_QUERY }, context: {} })
-          .then((response) => ({ name, response })),
+          .then((response) => ({ name, response }))
+          .catch((e) => {
+            throw new Error(`[${name}]: ${e.message}`);
+          }),
       ),
     );
   }
 
-  protected createSchema(
-    input: { serviceList: ServiceDefinition[] } | { csdl: string },
-  ) {
-    if ('serviceList' in input) {
-      return this.createSchemaFromServiceList(input.serviceList);
-    } else {
-      return this.createSchemaFromCsdl(input.csdl);
-    }
-  }
-
-  protected createSchemaFromServiceList(serviceList: ServiceDefinition[]) {
+  private createSchemaFromServiceList(serviceList: ServiceDefinition[]) {
     this.logger.debug(
       `Composing schema from service list: \n${serviceList
         .map(({ name, url }) => `  ${url || 'local'}: ${name}`)
@@ -571,10 +720,10 @@ export class ApolloGateway implements GraphQLService {
     }
   }
 
-  protected serviceListFromCsdl() {
+  private serviceListFromCsdl(csdl: DocumentNode) {
     const serviceList: Omit<ServiceDefinition, 'typeDefs'>[] = [];
 
-    visit(this.parsedCsdl!, {
+    visit(csdl, {
       SchemaDefinition(node) {
         findDirectivesOnNode(node, 'graph').forEach((directive) => {
           const name = directive.arguments?.find(
@@ -602,9 +751,9 @@ export class ApolloGateway implements GraphQLService {
     return serviceList;
   }
 
-  protected createSchemaFromCsdl(csdl: string) {
-    this.parsedCsdl = parse(csdl);
-    const serviceList = this.serviceListFromCsdl();
+  private createSchemaFromCsdl(csdl: string) {
+    this.parsedCsdl = gql(csdl);
+    const serviceList = this.serviceListFromCsdl(this.parsedCsdl);
 
     this.createServices(serviceList);
 
@@ -629,6 +778,7 @@ export class ApolloGateway implements GraphQLService {
     switch (this.state.phase) {
       case 'stopping':
       case 'stopped':
+      case 'failed to load':
         return;
       case 'initialized':
         throw Error('pollServices should not be called before load!');
@@ -683,7 +833,7 @@ export class ApolloGateway implements GraphQLService {
     };
 
     try {
-      await this.updateComposition();
+      await this.updateSchema();
     } catch (err) {
       this.logger.error((err && err.message) || err);
     }
@@ -733,7 +883,7 @@ export class ApolloGateway implements GraphQLService {
         });
   }
 
-  protected createServices(services: ServiceEndpointDefinition[]) {
+  private createServices(services: ServiceEndpointDefinition[]) {
     for (const serviceDef of services) {
       this.createAndCacheDataSource(serviceDef);
     }
@@ -741,7 +891,7 @@ export class ApolloGateway implements GraphQLService {
 
   protected async loadServiceDefinitions(
     config: RemoteGatewayConfig | ManagedGatewayConfig,
-  ): ReturnType<Experimental_UpdateServiceDefinitions> {
+  ): Promise<CompositionUpdate> {
     if (isRemoteConfig(config)) {
       const serviceList = config.serviceList.map((serviceDefinition) => ({
         ...serviceDefinition,
@@ -768,11 +918,25 @@ export class ApolloGateway implements GraphQLService {
       );
     }
 
-    return getServiceDefinitionsFromStorage({
+    // TODO(trevor:cloudconfig): This condition goes away completely
+    if (
+      !this.experimental_schemaConfigDeliveryEndpoint &&
+      !isPrecomposedManagedConfig(config)
+    ) {
+      return getServiceDefinitionsFromStorage({
+        graphId: this.apolloConfig!.graphId!,
+        apiKeyHash: this.apolloConfig!.keyHash!,
+        graphVariant: this.apolloConfig!.graphVariant,
+        federationVersion: config.federationVersion || 1,
+        fetcher: this.fetcher,
+      });
+    }
+
+    return loadCsdlFromStorage({
       graphId: this.apolloConfig!.graphId!,
-      apiKeyHash: this.apolloConfig!.keyHash!,
+      apiKey: this.apolloConfig!.key!,
       graphVariant: this.apolloConfig!.graphVariant,
-      federationVersion: config.federationVersion || 1,
+      endpoint: this.experimental_schemaConfigDeliveryEndpoint!,
       fetcher: this.fetcher,
     });
   }
@@ -944,7 +1108,7 @@ export class ApolloGateway implements GraphQLService {
     return response;
   };
 
-  protected validateIncomingRequest<TContext>(
+  private validateIncomingRequest<TContext>(
     requestContext: GraphQLRequestContextExecutionDidStart<TContext>,
     operationContext: OperationContext,
   ) {
@@ -969,8 +1133,9 @@ export class ApolloGateway implements GraphQLService {
   public async stop() {
     switch (this.state.phase) {
       case 'initialized':
+      case 'failed to load':
         throw Error(
-          'ApolloGateway.stop does not need to be called before ApolloGateway.load',
+          'ApolloGateway.stop does not need to be called before ApolloGateway.load is called successfully',
         );
       case 'stopped':
         // Calls to stop() are idempotent.
@@ -999,7 +1164,7 @@ export class ApolloGateway implements GraphQLService {
         return;
       }
       case 'polling': {
-        // We're in the middle of running updateComposition. We need to go into 'stopping'
+        // We're in the middle of running updateSchema. We need to go into 'stopping'
         // mode and let this run complete. First we set things up so that any concurrent
         // calls to stop() will wait until we let them finish. (Those concurrent calls shouldn't
         // just wait on pollingDonePromise themselves because we want to make sure we fully
@@ -1064,10 +1229,10 @@ export {
   Experimental_DidFailCompositionCallback,
   Experimental_DidResolveQueryPlanCallback,
   Experimental_DidUpdateCompositionCallback,
-  Experimental_UpdateServiceDefinitions,
+  Experimental_UpdateComposition,
   GatewayConfig,
   ServiceEndpointDefinition,
-  Experimental_CompositionInfo,
+  CompositionInfo,
 };
 
 export * from './datasources';
