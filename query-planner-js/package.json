@@ -1,6 +1,6 @@
 {
   "name": "@apollo/query-planner",
-  "version": "0.0.10-khan.1.debug",
+  "version": "0.0.10-khan.2.debug",
   "description": "Apollo Query Planner",
   "author": "Apollo <opensource@apollographql.com>",
   "main": "dist/index.js",
@@ -25,7 +25,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@apollo/query-planner-wasm": "http://github.com/Khan/federation.git#apollo-query-planner-wasm-v0.1.2-khan.2.debug-gitpkg",
+    "@apollo/query-planner-wasm": "http://github.com/Khan/federation.git#apollo-query-planner-wasm-v0.1.2-khan.3.debug-gitpkg",
     "pretty-format": "^26.0.0"
   },
   "peerDependencies": {

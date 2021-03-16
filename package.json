@@ -18,7 +18,9 @@
     "test:watch": "jest --verbose --watchAll",
     "testonly": "npm test",
     "test:ci": "npm test -- --ci --maxWorkers=2  --reporters=default --reporters=jest-junit",
-    "ensure-prereqs": "node ensure-prereqs.js"
+    "ensure-prereqs": "node ensure-prereqs.js",
+    "codegen": "graphql-codegen --config codegen.yml",
+    "codegen:check": "npm run codegen && git diff --exit-code"
   },
   "engines": {
     "node": ">=6 <15",
@@ -33,6 +35,9 @@
     "apollo-federation-integration-testsuite": "file:federation-integration-testsuite-js"
   },
   "devDependencies": {
+    "@graphql-codegen/cli": "1.21.2",
+    "@graphql-codegen/typescript": "1.21.1",
+    "@graphql-codegen/typescript-operations": "1.17.15",
     "@types/bunyan": "1.8.6",
     "@types/deep-freeze": "0.1.2",
     "@types/jest": "26.0.20",
@@ -43,9 +48,8 @@
     "@types/node-fetch": "2.5.8",
     "apollo-link": "1.2.14",
     "apollo-link-http": "1.5.17",
-    "apollo-server": "2.21.0",
+    "apollo-server": "2.21.1",
     "apollo-server-env": "3.0.0",
-    "apollo-server-testing": "2.21.0",
     "bunyan": "1.8.15",
     "deep-freeze": "0.0.1",
     "graphql": "15.5.0",
@@ -56,6 +60,7 @@
     "jest-junit": "12.0.0",
     "lerna": "3.22.1",
     "log4js": "6.3.0",
+    "mocked-env": "^1.3.2",
     "nock": "13.0.11",
     "node-fetch": "2.6.1",
     "prettier": "2.2.1",
